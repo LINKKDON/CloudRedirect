@@ -1,3 +1,7 @@
+> **Fork 声明 / Preservation fork**：原作者已删除上游仓库（`Selectively11/CloudRedirect`），本仓库为保留存档，非本人原生开发；主分支维持上游最终版 v2.6.5 原样。
+>
+> **Preservation fork**: the original author deleted the upstream repository. This is an archival copy, not my original work; the default branch preserves upstream's final v2.6.5 as-is.
+
 # CloudRedirect
 
 ""Steam Cloud"" for 'lua' games.
