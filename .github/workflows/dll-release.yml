@@ -20,7 +20,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -G "Ninja Multi-Config"
 
       # Core DLL only. The WPF frontend / CLI / chain-loader are not built here.
       - name: Build cloud_redirect.dll only
