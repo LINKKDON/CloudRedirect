@@ -1,0 +1,53 @@
+name: DLL Release
+run-name: ${{ github.event.inputs.version }} DLL build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, must match Fluent-Steam-Lua CloudRedirectVersion (e.g. v2.6.5)"
+        required: true
+        default: "v2.6.5"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      # Core DLL only. The WPF frontend / CLI / chain-loader are not built here.
+      - name: Build cloud_redirect.dll only
+        run: cmake --build build --config Release --target cloud_redirect
+
+      - name: Stage assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item build\Release\cloud_redirect.dll dist\
+          $hash = (Get-FileHash dist\cloud_redirect.dll -Algorithm SHA256).Hash
+          "$hash  cloud_redirect.dll" | Out-File dist\cloud_redirect.dll.sha256 -Encoding ascii -NoNewline
+
+      - name: Create tag
+        run: |
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ github.event.inputs.version }}
+          body: |
+            ## 说明
+            上游删库后的保留构建：源码为上游最终版 v2.6.5（+ README fork 声明），本包仅含主 DLL `cloud_redirect.dll` 及其 SHA256，供 Fluent-Steam-Lua 构建拉取；GUI 前端不在此构建。
+          files: |
+            dist/cloud_redirect.dll
+            dist/cloud_redirect.dll.sha256
