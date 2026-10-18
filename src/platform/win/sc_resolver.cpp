@@ -93,26 +93,95 @@ static uintptr_t ResolveServiceTransportVtable() {
     return SigScanner::ResolveVtableByRtti(".?AVCClientUnifiedServiceTransport@@");
 }
 
-// ── Global engine pointer ─────────────────────────────────────────────
-// Approach: FlushAppMinutesPlayed at +0x09 loads g_pCSteamEngine via
-// `mov rax, cs:[rip+disp]`. We can also scan for `lea rcx/rbx, [reg+0xE68]`
-// (CAppInfoCache offset) and backwalk to the preceding mov from global.
-// The CAppInfoCache approach is more generic and doesn't depend on any
-// single function existing.
+// ── AppInfoCache 偏移 ─────────────────────────────────────────────────
+// CSteamEngine -> CAppInfoCache 的偏移随 Steam 内部结构变化而漂移，
+// 写死必坏，所以现场推导：GetAppInfo 的每个调用点都会在调用前用
+// `lea reg, [引擎寄存器+disp32]` 装载缓存指针，把所有调用点的 disp32
+// 放进直方图，压倒性的那个值就是当前实际偏移。
 
-static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
-    // Strategy A: scan for `lea rcx, [reg+0xE68]` pattern (CAppInfoCache offset)
-    // Pattern bytes: 48 8D 89 68 0E 00 00 (lea rcx,[rcx+0xE68])
-    //           or:  48 8D 8B 68 0E 00 00 (lea rcx,[rbx+0xE68])
-    // ModR/M byte 89=rcx+rcx, 8B=rcx+rbx, 8F=rcx+rdi, 8E=rcx+rsi
-    // We use wildcard on the ModR/M to catch any source register:
-    //   48 8D ?? 68 0E 00 00  where byte[2] & 0xC7 == 0x81 (disp32 + base reg)
-    // Actually simpler: the 4-byte immediate 68 0E 00 00 (=0xE68) is distinctive.
+static uint32_t DetectAppInfoCacheOffset(uintptr_t getAppInfoAddr) {
+    if (!getAppInfoAddr) {
+        LOG("[Resolver] AppInfoCache offset: GetAppInfo unresolved, cannot derive");
+        return 0;
+    }
 
-    // Scan for any `lea reg, [reg + 0x00000E68]` -- 7-byte form with disp32
-    // The full pattern is: REX 8D ModRM disp32
-    // REX = 48 or 4C; opcode = 8D; ModRM & 0xC0 == 0x80 (mod=10 = disp32)
-    // and disp = 0x00000E68.
+    const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
+    size_t textSize = SigScanner::GetTextSize();
+    uintptr_t textBase = SigScanner::GetTextBase();
+
+    struct Entry { int32_t disp; int votes; };
+    Entry hist[32];
+    int histCount = 0;
+    int totalVotes = 0;
+    int callSites = 0;
+
+    __try {
+        for (size_t i = 0; i + 5 <= textSize; ++i) {
+            if (text[i] != 0xE8) continue;
+            int32_t rel = *reinterpret_cast<const int32_t*>(text + i + 1);
+            uintptr_t target = textBase + i + 5 + rel;
+            if (target != getAppInfoAddr) continue;
+            ++callSites;
+
+            // 在每个调用点的参数准备区向前回看：只统计 mod=10（disp32）
+            // 且基址为普通寄存器的 lea；栈帧偏移和 RIP 相对寻址的编码
+            // 不同，天然被排除，剩下的就是引擎对象内部偏移
+            int64_t lo = static_cast<int64_t>(i) - 96;
+            if (lo < 0) lo = 0;
+            for (int64_t j = static_cast<int64_t>(i) - 7; j >= lo; --j) {
+                if (text[j] < 0x48 || text[j] > 0x4F) continue;
+                if (text[j + 1] != 0x8D) continue;
+                uint8_t modrm = text[j + 2];
+                if ((modrm & 0xC0) != 0x80) continue;  // mod=10 -> disp32
+                uint8_t rm = modrm & 0x07;
+                if (rm == 4 || rm == 5) continue;      // SIB / RIP-relative
+                int32_t disp = *reinterpret_cast<const int32_t*>(text + j + 3);
+                // 只接受结构体偏移量级的值，顺便滤掉 rsp 附近的栈槽
+                if (disp < 0x100 || disp > 0x100000) continue;
+                ++totalVotes;
+                int k = 0;
+                for (; k < histCount; ++k) {
+                    if (hist[k].disp == disp) { hist[k].votes++; break; }
+                }
+                if (k == histCount && histCount < 32) {
+                    hist[histCount].disp = disp;
+                    hist[histCount].votes = 1;
+                    ++histCount;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (histCount == 0 || callSites < 5) {
+        LOG("[Resolver] AppInfoCache offset: insufficient evidence (%d call site(s))",
+            callSites);
+        return 0;
+    }
+
+    int best = 0;
+    for (int k = 1; k < histCount; ++k)
+        if (hist[k].votes > hist[best].votes) best = k;
+
+    // 要求最低票数和压倒性多数，防止少量无关 lea 把结果带偏
+    if (hist[best].votes < 10 || hist[best].votes * 10 < totalVotes * 7) {
+        LOG("[Resolver] AppInfoCache offset: ambiguous (best 0x%X with %d/%d votes over %d call site(s))",
+            hist[best].disp, hist[best].votes, totalVotes, callSites);
+        return 0;
+    }
+
+    LOG("[Resolver] AppInfoCache offset detected: 0x%X (%d call site(s))",
+        hist[best].disp, callSites);
+    return static_cast<uint32_t>(hist[best].disp);
+}
+
+// ── 引擎全局指针 ─────────────────────────────────────────────────────
+// 引擎对象的偏移由 Steam 布局决定，直接扫它比依赖某个已知函数更稳：
+// `lea reg, [reg+<cacheOff>]`（cacheOff 来自现场推导）出现后，向前
+// 回溯最近的 `mov reg, [rip+disp]` 就是全局指针装载点。
+
+static uintptr_t ResolveGlobalEngine(uintptr_t scBase, uint32_t appInfoCacheOff) {
+    // 扫描 `lea reg, [reg + appInfoCacheOff]`：48 8D xx <disp32>，
+    // ModRM & 0xC0 == 0x80（mod=10）且 disp32 等于推导出的偏移
     const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
     size_t textSize = SigScanner::GetTextSize();
 
@@ -120,25 +189,25 @@ static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
         for (size_t i = 0; i + 7 <= textSize; ++i) {
             if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
                 (text[i+2] & 0xC0) == 0x80) {
-                // Check disp32 == 0xE68
+                // 命中推导出的偏移才继续
                 int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
-                if (disp != 0xE68) continue;
+                if (disp != static_cast<int32_t>(appInfoCacheOff)) continue;
 
                 uintptr_t leaAddr = SigScanner::GetTextBase() + i;
 
-                // Walk backward up to 40 bytes looking for `mov reg, [rip+disp]`
+                // 从 lea 向前回看装载引擎全局的 `mov reg, [rip+disp]`
                 for (int back = 7; back <= 40; ++back) {
                     uintptr_t candidate = leaAddr - back;
                     if (candidate < SigScanner::GetTextBase()) break;
                     uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
                     if (global && global >= SigScanner::GetDataBase() &&
                         global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
-                        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0xE68 backwalk",
-                            (void*)global, (uint64_t)(global - scBase));
+                        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0x%X backwalk",
+                            (void*)global, (uint64_t)(global - scBase), appInfoCacheOff);
                         return global;
                     }
                 }
-                // Try next lea+0xE68 occurrence if backwalk failed
+                // 回溯失败就继续找下一处 lea
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -605,8 +674,17 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.ccmInterfaceVtable = ResolveCCMInterfaceVtable();
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
-    // Phase 2: Global engine pointer
-    r.globalEngine = ResolveGlobalEngine(steamClientBase);
+    // Phase 2：先由 GetAppInfo 调用点推导 AppInfoCache 偏移，再找引擎
+    // 全局指针。顺序不能反：ResolveGlobalEngine 靠装载缓存指针的 lea
+    // 扫描，必须先有偏移；推导失败时退回写死的旧值兜底。
+    r.getAppInfo = ResolveGetAppInfo();
+    uint32_t appInfoCacheOff = DetectAppInfoCacheOffset(r.getAppInfo);
+    if (!appInfoCacheOff) {
+        appInfoCacheOff = 0xE68;
+        LOG("[Resolver] AppInfoCache offset: falling back to legacy 0xE68");
+    }
+    r.engineOffAppInfoCache = appInfoCacheOff;
+    r.globalEngine = ResolveGlobalEngine(steamClientBase, appInfoCacheOff);
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -683,8 +761,8 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.kvSetInt     = ResolveKvSetInt();
     r.kvSetString  = ResolveKvSetString();
 
-    // Phase 9: AppInfo functions (signature-based, ReadConfigU64 anchored to GetAppInfo)
-    r.getAppInfo     = ResolveGetAppInfo();
+    // Phase 9：AppInfo 系列函数（GetAppInfo 已在 Phase 2 解析，
+    // ReadConfigU64 以它为锚点）
     r.getSection     = ResolveGetSection();
     r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo);
 
@@ -1007,13 +1085,13 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         }
     }
 
-    // Phase 19: Struct offsets (leave at 0 -- use hardcoded fallbacks for now)
+    // Phase 19：结构体偏移留 0，走代码内兜底值；
+    // engineOffAppInfoCache 已在 Phase 2 填入推导结果
     r.engineOffJobMgr       = 0;
     r.engineOffGlobalHandle = 0;
     r.engineOffUserMap      = 0;
     r.ccmOffConnContext     = 0;
     r.userOffCcmInterface   = 0;
-    r.engineOffAppInfoCache = 0xE68;
 
     LOG("[Resolver] === Auto-resolution complete ===");
     return r;

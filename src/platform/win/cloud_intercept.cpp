@@ -225,11 +225,11 @@ using NotificationSlot7Fn = bool(__fastcall*)(void* thisptr, const char* methodN
 // Slot 8 signature: notification wrapper - extracts body from CProtoBufMsg, calls slot 7
 //   rcx = this (CClientUnifiedServiceTransport*)
 //   rdx = methodName (const char*)
-//   r8  = request CProtoBufMsg* (body at +48, header at +40)
+//   r8  = request CProtoBufMsg* (body/header 偏移运行时探测)
 using NotificationSlot8Fn = bool(__fastcall*)(void* thisptr, const char* methodName,
                                                void* request);
 // sub_138BD0210: ParseFromArray - fills a protobuf message object from raw bytes
-//   rcx = protobuf message object (body at CProtoBufMsg+48)
+//   rcx = protobuf message object（body 对象取自 CProtoBufMsg，偏移运行时探测）
 //   rdx = raw data pointer
 //   r8  = raw data size (as int)
 using ParseFromArrayFn = char(__fastcall*)(void* msgBody, const char* data, int size);
@@ -1610,7 +1610,7 @@ const std::string& GetSteamPath() {
 }
 
 // Service-method vtable hook (Approach E): intercept Cloud RPCs via slot 4/5.
-// CProtoBufMsg layout: +40 header*, +48 body*
+// CProtoBufMsg 内 header/body 指针的偏移随 Steam 版本漂移，运行时探测（见 WrapperBodyOff）
 // CMsgProtoBufHeader: +16 has_bits, +24 appid, +116 routing_appid, +216 eresult, +220 error_code
 
 // Serialize a protobuf message body object to raw bytes
@@ -1725,6 +1725,53 @@ static bool SEH_WriteResponseHeader(void* respHeader, int32_t eresult = 1) {
         LOG("[VtHook] EXCEPTION writing response header: code=0x%08X", GetExceptionCode());
         return false;
     }
+}
+
+// CProtoBufMsg 内 header/body 指针的位置随 Steam 版本漂移：1791918634 上 body 在 +0x38
+// （更早的版本在 +0x30），这里不再写死偏移——首次处理 Cloud RPC 时按候选偏移试读并序列化，
+// 谁能解出非零 appId 谁就是真正的 body；探测结果本进程内常驻复用，header 恒为 body-8。
+static constexpr uint32_t CPB_BODY_OFF_NEW = 0x38;
+static constexpr uint32_t CPB_BODY_OFF_OLD = 0x30;
+static std::atomic<uint32_t> g_cpbBodyOff{0};
+
+// 读 CProtoBufMsg 的内部指针；布局不符时可能落到无效地址，交给 SEH 兜底返回空
+static void* SEH_ReadMsgField(void* msg, uint32_t off) {
+    __try {
+        return *(void**)((uintptr_t)msg + off);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// 当前生效的 body 偏移：探测结果优先，尚未探测到时按新布局取
+static uint32_t WrapperBodyOff() {
+    uint32_t off = g_cpbBodyOff.load(std::memory_order_relaxed);
+    return off != 0 ? off : CPB_BODY_OFF_NEW;
+}
+
+// 探测 CProtoBufMsg 的 body 偏移；请求/响应共用同一布局，命中一次全局复用
+static bool ProbeWrapperBodyOff(const char* methodName, void* request,
+                                uint32_t* outOff, void** outBody, std::vector<uint8_t>* outBytes) {
+    static const uint32_t kCandidates[] = { CPB_BODY_OFF_NEW, CPB_BODY_OFF_OLD };
+    for (uint32_t off : kCandidates) {
+        void* candidate = SEH_ReadMsgField(request, off);
+        if (!candidate) continue;
+        // header 指针是结构约束：body 恒在 header 后 8 字节处。header/body 都
+        // 序列化得出 appId 时，光靠「非空 + appId」仍可能把 header 误认成 body，
+        // 补上 header 非空校验排除这类误读，避免缓存一个错误偏移。
+        if (!SEH_ReadMsgField(request, off - 8)) continue;
+        auto bytes = SerializeBodyToBytes(candidate);
+        if (bytes.empty()) continue;
+        auto fields = PB::Parse(bytes.data(), bytes.size());
+        if (CloudRpcUtils::ExtractAppId(methodName, fields) == 0) continue;
+        g_cpbBodyOff.store(off, std::memory_order_relaxed);
+        LOG("[VtHook] CProtoBufMsg layout: body at +0x%X (%zu bytes, probed)", off, bytes.size());
+        *outOff = off;
+        *outBody = candidate;
+        *outBytes = std::move(bytes);
+        return true;
+    }
+    return false;
 }
 
 // Shared Cloud RPC dispatch - routes a method name to the appropriate handler.
@@ -1965,11 +2012,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
+    // 本次调用读取 CProtoBufMsg 用的 body 偏移（header = body-8）；未探测出时按新布局
+    uint32_t bodyOff = WrapperBodyOff();
+
     if (g_parentalBypassPlaytime.load() &&
         strcmp(methodName, "Parental.GetSignedParentalSettings#1") == 0) {
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         if (result && response) {
-            void* respBody = *(void**)((uintptr_t)response + 48);
+            void* respBody = SEH_ReadMsgField(response, bodyOff);
             if (respBody) {
                 auto respBytes = SerializeBodyToBytes(respBody);
                 auto respFields = PB::Parse(respBytes.data(), respBytes.size());
@@ -1999,7 +2049,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             ? MetadataSync::schemaFetch.load(std::memory_order_relaxed)
             : MetadataSync::SchemaFetchEnabled())) {
         if (request && response) {
-            void* reqBody = *(void**)((uintptr_t)request + 48);
+            void* reqBody = SEH_ReadMsgField(request, bodyOff);
             if (reqBody) {
                 auto reqBytes = SerializeBodyToBytes(reqBody);
                 auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2009,7 +2059,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                 LOG("[Stats] slot5 GetUserStats seen: app=%u namespace=%d", appId, IsNamespaceApp(appId) ? 1 : 0);
                 if (appId != 0 && IsNamespaceApp(appId)) {
                     auto res = StatsHandlers::HandleGetUserStats(appId, reqFields);
-                    void* respBody = *(void**)((uintptr_t)response + 48);
+                    void* respBody = SEH_ReadMsgField(response, bodyOff);
                     if (respBody && res.body.Size() > 0 &&
                         ParseBytesToBody(respBody, res.body.Data().data(), res.body.Size())) {
                         if (flags) *flags = 0;
@@ -2018,7 +2068,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                         return true;
                     }
                     LOG("[Stats] GetUserStats app=%u NOT handled (respBody=%p bodySize=%zu) -> passthrough",
-                        appId, *(void**)((uintptr_t)response + 48), res.body.Size());
+                        appId, respBody, res.body.Size());
                 }
             } else {
                 LOG("[Stats] slot5 GetUserStats: null reqBody -> passthrough");
@@ -2035,12 +2085,12 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         LOG("[Stats] slot5 GetLastPlayedTimes seen: serverResult=%d", result ? 1 : 0);
         if (result && response) {
-            void* respBody = *(void**)((uintptr_t)response + 48);
+            void* respBody = SEH_ReadMsgField(response, bodyOff);
             if (respBody) {
                 // Parse the request to honor min_last_played.
                 std::vector<PB::Field> reqFields;
                 if (request) {
-                    void* reqBody = *(void**)((uintptr_t)request + 48);
+                    void* reqBody = SEH_ReadMsgField(request, bodyOff);
                     if (reqBody) {
                         auto reqBytes = SerializeBodyToBytes(reqBody);
                         reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2107,15 +2157,21 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // Extract the request body from CProtoBufMsg+48
-    void* reqBody = *(void**)((uintptr_t)request + 48);
-    if (!reqBody) {
-        LOG("[VtHook] %s: request body is NULL, passing through", methodName);
+    // 取请求体：偏移未探测出时按候选偏移探测一次，探测失败直接放行
+    void* reqBody = nullptr;
+    std::vector<uint8_t> reqBytes;
+    if (g_cpbBodyOff.load(std::memory_order_relaxed) != 0) {
+        reqBody = SEH_ReadMsgField(request, bodyOff);
+        if (reqBody) reqBytes = SerializeBodyToBytes(reqBody);
+    } else if (!ProbeWrapperBodyOff(methodName, request, &bodyOff, &reqBody, &reqBytes)) {
+        LOG("[VtHook] %s: CProtoBufMsg layout unresolved, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // Serialize request body to raw protobuf bytes
-    auto reqBytes = SerializeBodyToBytes(reqBody);
+    if (reqBytes.empty()) {
+        LOG("[VtHook] %s: request body empty (bodyOff=0x%X), passing through", methodName, bodyOff);
+        return g_originalSlot5(thisptr, methodName, request, response, flags);
+    }
     LOG("[VtHook] %s: request body %zu bytes", methodName, reqBytes.size());
 
     // Parse the raw bytes to get fields
@@ -2151,7 +2207,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             bool spyResult = g_originalSlot5(thisptr, methodName, request, response, flags);
             // Inspect the response body only on success: a failed call may leave the
             // body slot without a constructed message.
-            void* spyRespBody = spyResult ? *(void**)((uintptr_t)response + 48) : nullptr;
+            void* spyRespBody = spyResult ? SEH_ReadMsgField(response, bodyOff) : nullptr;
             if (spyRespBody) {
                 auto respBytes = SerializeBodyToBytes(spyRespBody);
                 LOG("[SPY] %s app=%u native response (%zu bytes, result=%d):",
@@ -2178,7 +2234,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Capture SteamID from the request header. Detects account switches.
     if (!g_steamIdFromHeader.load()) {
-        void* reqHeader = *(void**)((uintptr_t)request + 40);
+        void* reqHeader = SEH_ReadMsgField(request, bodyOff - 8);
         if (reqHeader) {
             auto hdrBytes = SerializeBodyToBytes(reqHeader);
             if (!hdrBytes.empty()) {
@@ -2244,14 +2300,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Validate response header BEFORE writing body to avoid corrupting the
     // response protobuf object on a failure path.
-    void* respHeader = *(void**)((uintptr_t)response + 40);
+    void* respHeader = SEH_ReadMsgField(response, bodyOff - 8);
     if (!respHeader) {
         LOG("[VtHook] %s: respHeader is NULL, cannot deliver response", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
     // Write the response body into the response CProtoBufMsg
-    void* respBody = *(void**)((uintptr_t)response + 48);
+    void* respBody = SEH_ReadMsgField(response, bodyOff);
     if (!respBody) {
         LOG("[VtHook] %s: response body object is NULL, cannot write response!", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
@@ -2264,7 +2320,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         }
     }
 
-    // Write eresult into response header (CProtoBufMsg+40):
+    // 写 eresult 进响应 header（header = bodyOff-8，其内部字段偏移不受外层布局变化影响）:
     //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (error_message)
     //   header+216 = eresult, header+220 = error_code
     if (!SEH_WriteResponseHeader(respHeader, result.eresult)) {
@@ -2325,7 +2381,7 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
 }
 
 // Slot 8 hook - Notification wrapper (e.g. SignalAppExitSyncDone)
-// request is a CProtoBufMsg* with body at +48, header at +40
+// request 是 CProtoBufMsg*，body/header 偏移运行时探测（见 WrapperBodyOff）
 static bool __fastcall NotificationWrapperHook(void* thisptr, const char* methodName, void* request) {
     HookGuard guard;
     if (g_shuttingDown.load(std::memory_order_acquire))
@@ -2334,9 +2390,12 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
+    // body/header 偏移运行时探测的结果，本函数只读
+    const uint32_t bodyOff = WrapperBodyOff();
+
     if (ParentalBypass::IsParentalNotification(methodName) && g_parentalBypassPlaytime.load()) {
         if (request) {
-            void* bodyObj = *(void**)((uintptr_t)request + 48);
+            void* bodyObj = SEH_ReadMsgField(request, bodyOff);
             if (bodyObj && strcmp(methodName, ParentalBypass::NOTIFY_SETTINGS_CHANGE) == 0) {
                 auto bodyBytes = SerializeBodyToBytes(bodyObj);
                 auto notifFields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -2374,8 +2433,8 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
-    // Extract body from CProtoBufMsg+48
-    void* bodyObj = *(void**)((uintptr_t)request + 48);
+    // 取通知体（body 偏移运行时探测）
+    void* bodyObj = SEH_ReadMsgField(request, bodyOff);
     uint32_t realAppId = CheckNotificationNamespaceApp(methodName, bodyObj);
 
     if (realAppId == 0) {
