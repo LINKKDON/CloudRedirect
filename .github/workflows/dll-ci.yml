@@ -1,0 +1,43 @@
+name: DLL CI Build
+run-name: DLL build ${{ github.sha }}
+
+# 每次 push 到主分支的源码改动时自动构建主 DLL 并上传 artifact，
+# 供快速验证改动是否可编译（release 另走 dll-release.yml 手动触发）。
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/dll-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build -G "Ninja Multi-Config"
+
+      # 仅主 DLL。WPF 前端 / CLI / chain-loader 不在此构建（同 dll-release.yml）。
+      - name: Build cloud_redirect.dll only
+        run: cmake --build build --config Release --target cloud_redirect
+
+      - name: Compute SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash build\Release\cloud_redirect.dll -Algorithm SHA256).Hash
+          "$hash  cloud_redirect.dll" | Out-File build\Release\cloud_redirect.dll.sha256 -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloud_redirect-dll-${{ github.sha }}
+          path: |
+            build/Release/cloud_redirect.dll
+            build/Release/cloud_redirect.dll.sha256

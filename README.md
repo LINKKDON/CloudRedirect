@@ -1,6 +1,6 @@
-> **Fork 声明 / Preservation fork**：原作者已删除上游仓库（`Selectively11/CloudRedirect`），本仓库为保留存档，非本人原生开发；主分支维持上游最终版 v2.6.5 原样。
+> **维护声明**：原作者已删除上游仓库（`Selectively11/CloudRedirect`）。本仓库最初作为个人留档保存了上游代码，现由本人基于该存档**自行二次维护**——持续适配 Windows 版本 Steam 更新、修复问题并迭代功能，主分支不再保持上游原样。
 >
-> **Preservation fork**: the original author deleted the upstream repository. This is an archival copy, not my original work; the default branch preserves upstream's final v2.6.5 as-is.
+> **Maintenance Notice**: The original author has deleted the upstream repository (`Selectively11/CloudRedirect`). This repository was initially kept as a personal archive of the upstream code, and is now independently maintained by me based on that archive—continuously adapting to Windows version Steam updates, fixing issues, and iterating on features. The main branch no longer remains identical to the original upstream.
 
 # CloudRedirect
 
@@ -35,8 +35,6 @@ CloudRedirect for Windows consists of a C++ DLL and a WPF companion app:
 3. When a lua game attempts to read or write cloud save data, the DLL intercepts the calls and redirects it. If the game is owned, the game uses normal Steam Cloud as expected. If a lua is present that only unlocks DLC, the game will use normal Steam Cloud.
 4. More dark magic occurs. Saves sync. Bytes flow. This all is visible in the Steam UI and looks identical to normal Steam Cloud functionality.
 
-Same rough idea on Linux, but involving a flatpak application and a library that is loaded on steam startup instead. 
-   
 ## Supported cloud providers
 
 - **Google Drive**
@@ -49,24 +47,11 @@ With more to come over time.
 
 ## Usage (Windows)
 
-Grab the latest release from the [Releases page](https://github.com/Selectively11/CloudRedirect/releases).
+Grab the latest release from the [Releases page](https://github.com/huanyuejue/CloudRedirect/releases).
 
 Run the EXE. Pick your mode - STfixer mode for fixes to ST bugs, CloudRedirect mode for the good stuff. In Setup, hit 'Run All Patches'. Go to the Cloud Provider tab, select your provider. If it is a cloud provider, sign in to it.
 
 That's it. Go launch Steam and watch the magic.
-
-## Usage (Linux)
-
-Edit your SLSsteam config, set DisableCloud to No. 
-
-
-```curl -fsSL headcrab.pages.dev | bash```
-
-Open the CloudRedirect app, sign into a provider.
-
-Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 
-
-Now launch Steam and watch your games sync!
 
 ## Building from source (Windows)
 
@@ -85,18 +70,6 @@ cmake --build build --config Release
 This builds both the C++ DLL (`build/Release/cloud_redirect.dll`) and publishes the WPF app (`ui/bin/publish/CloudRedirect.exe`). The DLL is automatically embedded into the executable.
 
 Or don't build it? Building Windows apps is pain.
-
-## Building from source (Linux)
-
-Oooooh boy. Yeah. Have fun. 
-
-You need to build against glibc 2.31 or older. Ubuntu 20.04 would work, if you dislike yourself. There's also an ancient version of Fedora that fits the bill. Or Debian 11. Distrobox is the way, here. Don't even bother trying to build under whatever distro you daily, you'll wind up fighting it for no reason. Distrobox exists for a reason. 
-
-If you are building under Ubuntu 20.04, GCC 12 is needed along with the 32-bit multilib stuff. System cmake is ancient garbage, you'll have to update it.
-
-Then specify -DLINUX_32BIT=ON and wham bam.
-
-Isn't building for weird distros _fun?_
 
 ## Contibuting
 
