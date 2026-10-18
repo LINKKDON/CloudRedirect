@@ -47,7 +47,8 @@ jobs:
           name: ${{ github.event.inputs.version }}
           body: |
             ## 说明
-            个人二次维护分支构建：在原作者删库后的留档基础上持续适配 Steam 更新（含 build 1791918634 布局适配）。本包仅含主 DLL `cloud_redirect.dll` 及其 SHA256，供 Fluent-Steam-Lua 构建拉取；GUI 前端不在此构建。
+            本包仅含主 DLL `cloud_redirect.dll` 及其 SHA256，供 [Fluent-Steam-Lua](https://github.com/huanyuejue/Fluent-Steam-Lua) 项目构建时拉取集成。
+            不构建 GUI，也不维护 GUI。
           files: |
             dist/cloud_redirect.dll
             dist/cloud_redirect.dll.sha256
