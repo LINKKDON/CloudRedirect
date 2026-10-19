@@ -3,6 +3,7 @@
 
 #include "cloud_provider_base.h"
 #include "http_util.h"
+#include "sha256_hmac.h"
 #include "log.h"
 
 #include <Windows.h>
@@ -35,13 +36,141 @@ public:
         return true;
     }
 
-    // Scale send/receive timeouts with body size so multi-MB PUTs survive a slow link
-    // without making small requests wait on the 10s session default.
-    static void TuneTimeoutsForBody(HINTERNET hReq, size_t bodyBytes) {
-        if (bodyBytes <= 256 * 1024) return; // small requests keep the fast default
-        int sendMs = 60000;    // allow a multi-MB body to finish uploading
-        int receiveMs = 30000; // allow Drive to commit and reply
+    // 请求体较大时放宽发送/接收超时，避免几 MB 的上传在慢链路上被默认 10 秒掐断；
+    // 小请求仍用快速默认值。显式配置了 timeoutSec 时以配置为准。
+    void ApplyRequestOptions(HINTERNET hReq, size_t bodyBytes) {
+        if (m_opts.disableRedirects) {
+            DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
+        }
+        if (m_opts.timeoutSec > 0) {
+            int sec = m_opts.timeoutSec > 300 ? 300 : m_opts.timeoutSec;
+            WinHttpSetTimeouts(hReq, 5000, 5000, sec * 1000, sec * 1000);
+            return;
+        }
+        if (bodyBytes <= 256 * 1024) return;
+        int sendMs = 60000;
+        int receiveMs = 30000;
         WinHttpSetTimeouts(hReq, 5000, 5000, sendMs, receiveMs);
+    }
+
+    // 调用方显式写了 Authorization（自定义 token 等）时以调用方为准，
+    // 避免同一请求出现两个 Authorization 头把服务端搞糊涂。
+    static bool HasAuthorizationHeader(const std::vector<std::string>& hdrs) {
+        static const char kName[] = "authorization";
+        const size_t nameLen = sizeof(kName) - 1;
+        for (const auto& h : hdrs) {
+            size_t i = 0;
+            while (i < h.size() && (unsigned char)h[i] <= ' ') ++i;
+            if (h.size() - i <= nameLen || h[i + nameLen] != ':') continue;
+            bool match = true;
+            for (size_t k = 0; k < nameLen; ++k) {
+                if (tolower((unsigned char)h[i + k]) != kName[k]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
+    // Basic/Bearer 由我预发送；Digest/NTLM/Negotiate 需要先拿 401 挑战，
+    // 交给 SendRequestWithAuth 处理。
+    void AddAuthHeaders(std::vector<std::string>& hdrs) const {
+        if (m_opts.authScheme == ServerAuthScheme::None ||
+            HasAuthorizationHeader(hdrs)) return;
+        if (m_opts.authScheme == ServerAuthScheme::Basic) {
+            std::string creds = m_opts.username + ":" + m_opts.password;
+            hdrs.push_back("Authorization: Basic " +
+                crypto::Base64Encode(reinterpret_cast<const uint8_t*>(creds.data()), creds.size()));
+        } else if (m_opts.authScheme == ServerAuthScheme::Bearer &&
+                   !m_opts.bearerToken.empty()) {
+            hdrs.push_back("Authorization: Bearer " + m_opts.bearerToken);
+        }
+    }
+
+    bool IsNegotiatedAuth() const {
+        switch (m_opts.authScheme) {
+        case ServerAuthScheme::Negotiated:
+        case ServerAuthScheme::Digest:
+        case ServerAuthScheme::Ntlm:
+        case ServerAuthScheme::Negotiate:
+            return !m_opts.username.empty() || !m_opts.password.empty();
+        default:
+            return false;
+        }
+    }
+
+    DWORD PickAuthScheme(DWORD supported) const {
+        auto has = [&](DWORD s) { return (supported & s) != 0; };
+        switch (m_opts.authScheme) {
+        case ServerAuthScheme::Digest:
+            return has(WINHTTP_AUTH_SCHEME_DIGEST) ? WINHTTP_AUTH_SCHEME_DIGEST : 0;
+        case ServerAuthScheme::Ntlm:
+            return has(WINHTTP_AUTH_SCHEME_NTLM) ? WINHTTP_AUTH_SCHEME_NTLM : 0;
+        case ServerAuthScheme::Negotiate:
+            return has(WINHTTP_AUTH_SCHEME_NEGOTIATE) ? WINHTTP_AUTH_SCHEME_NEGOTIATE : 0;
+        default:
+            if (has(WINHTTP_AUTH_SCHEME_NEGOTIATE)) return WINHTTP_AUTH_SCHEME_NEGOTIATE;
+            if (has(WINHTTP_AUTH_SCHEME_NTLM))      return WINHTTP_AUTH_SCHEME_NTLM;
+            if (has(WINHTTP_AUTH_SCHEME_DIGEST))    return WINHTTP_AUTH_SCHEME_DIGEST;
+            if (has(WINHTTP_AUTH_SCHEME_BASIC))     return WINHTTP_AUTH_SCHEME_BASIC;
+            return 0;
+        }
+    }
+
+    bool QueryStatus(HINTERNET hReq, DWORD& status) const {
+        DWORD code = 0, len = sizeof(code);
+        if (!WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX))
+            return false;
+        status = code;
+        return true;
+    }
+
+    bool SendOnce(HINTERNET hReq, const std::string& body) {
+        BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
+            (DWORD)body.size(), 0);
+        if (!ok) {
+            LOG("%s WinHttpSendRequest failed: error %lu", m_logTag, GetLastError());
+            return false;
+        }
+        ok = WinHttpReceiveResponse(hReq, nullptr);
+        if (!ok) {
+            LOG("%s WinHttpReceiveResponse failed: error %lu", m_logTag, GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    // 发送请求；协商类认证会先收到 401，再查询服务端支持的方案并重放，
+    // Negotiate/NTLM 通常需要多轮往返。
+    bool SendRequestWithAuth(HINTERNET hReq, const std::string& body) {
+        if (!SendOnce(hReq, body)) return false;
+        if (!IsNegotiatedAuth()) return true;
+
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            DWORD status = 0;
+            if (!QueryStatus(hReq, status) || status != 401) break;
+            DWORD supported = 0, first = 0, target = 0;
+            if (!WinHttpQueryAuthSchemes(hReq, &supported, &first, &target)) {
+                LOG("%s WinHttpQueryAuthSchemes failed: %lu", m_logTag, GetLastError());
+                break;
+            }
+            DWORD scheme = PickAuthScheme(supported);
+            if (!scheme) {
+                LOG("%s server offered no usable auth scheme (0x%lX)", m_logTag, supported);
+                break;
+            }
+            auto wUser = HttpUtil::Widen(m_opts.username);
+            auto wPass = HttpUtil::Widen(m_opts.password);
+            if (!WinHttpSetCredentials(hReq, target, scheme,
+                    wUser.c_str(), wPass.c_str(), nullptr)) {
+                LOG("%s WinHttpSetCredentials failed: %lu", m_logTag, GetLastError());
+                break;
+            }
+            if (!SendOnce(hReq, body)) return false;
+        }
+        return true;
     }
 
     void Shutdown() override {
@@ -73,19 +202,16 @@ public:
             WINHTTP_FLAG_SECURE | WINHTTP_FLAG_ESCAPE_DISABLE);
         if (!hReq) { WinHttpCloseHandle(hConn); return resp; }
 
-        for (auto& h : hdrs) {
+        std::vector<std::string> allHdrs = hdrs;
+        AddAuthHeaders(allHdrs);
+        for (auto& h : allHdrs) {
             auto wh = Widen(h);
             WinHttpAddRequestHeaders(hReq, wh.c_str(), (DWORD)wh.size(),
                                       WINHTTP_ADDREQ_FLAG_ADD);
         }
 
-        TuneTimeoutsForBody(hReq, body.size());
-        BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
-            (DWORD)body.size(), 0);
-        if (!ok) LOG("%s WinHttpSendRequest failed: error %lu", m_logTag, GetLastError());
-        if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
-        if (!ok) LOG("%s WinHttpReceiveResponse failed: error %lu", m_logTag, GetLastError());
+        ApplyRequestOptions(hReq, body.size());
+        BOOL ok = SendRequestWithAuth(hReq, body);
 
         if (ok) {
             DWORD code = 0, codeLen = sizeof(code);
@@ -125,10 +251,21 @@ public:
 
         INTERNET_PORT port = isHttps ? INTERNET_DEFAULT_HTTPS_PORT
                                      : INTERNET_DEFAULT_HTTP_PORT;
-        size_t colonPos = host.find(':');
-        if (colonPos != std::string::npos) {
-            port = (INTERNET_PORT)atoi(host.substr(colonPos + 1).c_str());
-            host = host.substr(0, colonPos);
+        // IPv6 字面量形如 [::1]:8080，先剥掉方括号再取端口；
+        // 否则按第一个 ':' 切分会把主机名截成 '['。
+        if (!host.empty() && host.front() == '[') {
+            size_t close = host.find(']');
+            if (close != std::string::npos) {
+                if (close + 1 < host.size() && host[close + 1] == ':')
+                    port = (INTERNET_PORT)atoi(host.substr(close + 2).c_str());
+                host = host.substr(1, close - 1);
+            }
+        } else {
+            size_t colonPos = host.find(':');
+            if (colonPos != std::string::npos) {
+                port = (INTERNET_PORT)atoi(host.substr(colonPos + 1).c_str());
+                host = host.substr(0, colonPos);
+            }
         }
 
         auto wHost = Widen(host);
@@ -152,20 +289,17 @@ public:
                              &secFlags, sizeof(secFlags));
         }
 
-        for (auto& h : hdrs) {
+        std::vector<std::string> allHdrs = hdrs;
+        AddAuthHeaders(allHdrs);
+        for (auto& h : allHdrs) {
             auto wh = Widen(h);
             WinHttpAddRequestHeaders(hReq, wh.c_str(), (DWORD)wh.size(),
                                       WINHTTP_ADDREQ_FLAG_ADD);
         }
 
         HttpResp resp;
-        TuneTimeoutsForBody(hReq, body.size());
-        BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
-            (DWORD)body.size(), 0);
-        if (!ok) LOG("%s WinHttpSendRequest failed for URL: error %lu", m_logTag, GetLastError());
-        if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
-        if (!ok) LOG("%s WinHttpReceiveResponse failed for URL: error %lu", m_logTag, GetLastError());
+        ApplyRequestOptions(hReq, body.size());
+        BOOL ok = SendRequestWithAuth(hReq, body);
 
         if (ok) {
             DWORD code = 0, codeLen = sizeof(code);

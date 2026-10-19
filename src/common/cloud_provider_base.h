@@ -22,10 +22,31 @@ extern std::atomic<uint64_t> g_rateLimitHits;
 // 24 MB). Lower keeps each large blob above the request receive timeout.
 extern std::atomic<uint64_t> g_uploadInFlightCapBytes;
 
+// 直连任意 HTTP 端点的 provider（WebDAV）用到的服务端认证方式；
+// OAuth provider 保持 None，自己维护鉴权头。
+enum class ServerAuthScheme {
+    None = 0,
+    Basic,       // 预发送 Authorization: Basic
+    Bearer,      // Authorization: Bearer <token>
+    Negotiated,  // 401 协商：Negotiate > NTLM > Digest > Basic
+    Digest,      // 仅 Digest
+    Ntlm,        // 仅 NTLM
+    Negotiate,   // 仅 Negotiate
+};
+
 struct TransportOptions {
-    bool allowInsecureHttp = false;   // permit plaintext http:// (LAN MinIO/Garage)
-    bool allowInsecureTls  = false;   // skip TLS cert verification (self-signed)
-    std::string caCertPath;           // custom CA bundle for internal CAs
+    bool allowInsecureHttp = false;   // 允许明文 http://（内网 MinIO/Garage 等）
+    bool allowInsecureTls  = false;   // 跳过 TLS 证书校验（自签证书）
+    std::string caCertPath;           // 自定义 CA（Linux）
+    // 置位时把 3xx 原样返回给调用方，由调用方控制同源跳转，避免凭据外泄。
+    bool disableRedirects = false;
+    // 覆盖连接/发送/接收超时（秒），0 表示沿用传输层默认值。
+    int timeoutSec = 0;
+    // 由传输层统一施加的服务端认证配置。
+    ServerAuthScheme authScheme = ServerAuthScheme::None;
+    std::string username;
+    std::string password;
+    std::string bearerToken;
 };
 
 class IHttpTransport {

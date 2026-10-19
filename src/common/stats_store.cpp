@@ -1792,12 +1792,19 @@ void ResetStats(uint32_t appId) {
 }
 
 // Migrate legacy per-app blobs into the consolidated account blob.
+// The old layout only exists for accounts upgraded from 2.3.x, so probe each account
+// once and remember it: an empty account blob otherwise makes every launch download
+// one stats.json per app, which burns WebDAV request quotas (Jianguoyun 503s).
 static void MigrateLegacyBlobs(const std::vector<uint32_t>& appIds) {
     CloudPullLegacyFn pullLegacy;
     std::vector<uint32_t> missing;
+    fs::path marker;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_cloudPullLegacy) return;
+        if (g_diskAccountId != 0)
+            marker = FileUtil::Utf8ToPath(g_storageRoot) /
+                     (".legacy_stats_blob_done_" + std::to_string(g_diskAccountId));
         pullLegacy = g_cloudPullLegacy;
         for (uint32_t appId : appIds) {
             if (appId == 0) continue;
@@ -1805,6 +1812,11 @@ static void MigrateLegacyBlobs(const std::vector<uint32_t>& appIds) {
                 missing.push_back(appId);
         }
     }
+    if (!marker.empty()) {
+        std::error_code ec;
+        if (fs::exists(marker, ec)) return;
+    }
+    LOG("[Stats] Legacy blob migration: probing %zu app(s)", missing.size());
     for (uint32_t appId : missing) {
         std::string legacy = pullLegacy(appId);   // network, off-lock
         if (legacy.empty()) continue;
@@ -1818,6 +1830,8 @@ static void MigrateLegacyBlobs(const std::vector<uint32_t>& appIds) {
         LOG("[Stats] Migrated legacy per-app blob for app %u (forever=%u)",
             appId, parsed.playtime.minutesForever);
     }
+    if (!marker.empty())
+        std::ofstream(marker.string(), std::ios::trunc) << "1";
 }
 
 // Parse the first-format playtime JSON ({"LastPlayed","Playtime","Playtime2wks"}).
@@ -1882,7 +1896,10 @@ static void ApplyLegacyPlaytime(uint32_t appId, uint32_t mins,
 }
 
 // Migrate 2.2.x Playtime/*.bin format. Done-marker prevents reruns.
-static void MigrateLegacyPlaytimeBins(const std::vector<uint32_t>& appIds) {
+// cloudReachable=false means the account blob read failed (provider busy/offline):
+// skip the network pass so a broken provider doesn't fan out one request per app.
+static void MigrateLegacyPlaytimeBins(const std::vector<uint32_t>& appIds,
+                                      bool cloudReachable) {
     std::error_code ec;
 
     // Pass 1: global marker for local scan. Pass 2: per-app markers for cloud.
@@ -1931,6 +1948,11 @@ static void MigrateLegacyPlaytimeBins(const std::vector<uint32_t>& appIds) {
 
     // Pass 2: cloud copies (the .bin may exist only in the cloud). Per-app guarded:
     // skip apps already recovered, retry the rest. Max-merge prefers higher local/cloud.
+    // A provider that just failed the account blob read is not worth 100+ probes.
+    if (!cloudReachable) {
+        LOG("[Stats] Legacy playtime cloud pass skipped: provider unavailable");
+        return;
+    }
     CloudPullLegacyPlaytimeFn pullPt;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1948,8 +1970,9 @@ static void MigrateLegacyPlaytimeBins(const std::vector<uint32_t>& appIds) {
     }
     // Marker contents: "done" once recovered/given up; a number = empty-pull attempts
     // so far (retry next launch). After kMaxTries empties we stop -- the format is
-    // frozen, so a missing bin won't appear.
-    static const int kMaxTries = 8;
+    // frozen, so a missing bin won't appear. Retry only enough to cover a transient
+    // provider error; the old 8-pass retry multiplied startup requests on WebDAV.
+    static const int kMaxTries = 2;
     for (uint32_t appId : appIds) {
         if (appId == 0) continue;
         fs::path mk = cloudMarkerDir / std::to_string(appId);
@@ -2007,11 +2030,16 @@ void SeedApps(const std::vector<uint32_t>& appIds) {
     }
     // One network read for the whole account, not one per app. GetOrCreate then
     // reads each app's entry from the cached blob (no further network).
-    RefreshCloudBlobCache();
-    // Recover stats stranded under the old per-app cloud layout.
-    MigrateLegacyBlobs(appIds);
+    bool blobOk = RefreshCloudBlobCache();
+    // Recover stats stranded under the old per-app cloud layout. When the blob read
+    // failed (server busy/offline) don't fan out one download per app into the storm.
+    if (blobOk)
+        MigrateLegacyBlobs(appIds);
+    else
+        LOG("[Stats] Cloud blob unavailable; skipping legacy blob migration");
     // Recover playtime from the very first 2.2.x per-app .bin format (local+cloud).
-    MigrateLegacyPlaytimeBins(appIds);
+    // The cloud pass is gated on the same reachability signal as the blob migration.
+    MigrateLegacyPlaytimeBins(appIds, blobOk);
     for (uint32_t appId : appIds) {
         if (appId == 0) continue;
         GetOrCreate(appId);  // merges cached cloud blob + imports native + loads local

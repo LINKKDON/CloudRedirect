@@ -1295,7 +1295,7 @@ static void PrintUsage() {
     fprintf(stderr, "  gc-blobs <provider> <account_id> <app_id> <cloud_root>  Delete unreferenced SHA blobs from cloud\n");
     fprintf(stderr, "  scan-all <provider>                                       List all apps across all accounts (single-pass)\n");
     fprintf(stderr, "  migrate <src_provider> <dst_provider>                     Copy all cloud data from one provider to another\n");
-    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3\n");
+    fprintf(stderr, "\nProviders: gdrive, onedrive, r2, s3, folder, webdav\n");
 }
 
 int RunCli(int argc, char** argv) {

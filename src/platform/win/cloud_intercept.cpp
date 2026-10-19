@@ -4925,14 +4925,23 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
         configFile.close();
         auto cfg = Json::Parse(configStr);
         std::string providerName = cfg["provider"].str();
+        std::string providerKey = providerName;
+        for (auto& c : providerKey) c = (char)tolower((unsigned char)c);
         std::string tokenPath = cfg["token_path"].str();
+        // 宿主可能只写 provider + token_paths（或依赖约定文件名），
+        // 这里按 CLI 相同的规则回退解析，避免因 token_path 缺失退回纯本地模式。
+        if (tokenPath.empty() && providerKey != "folder" && providerKey != "local") {
+            size_t sep = configPath.find_last_of("\\/");
+            std::string cfgDir = (sep == std::string::npos) ? "" : configPath.substr(0, sep + 1);
+            tokenPath = ResolveProviderTokenPath(cfgDir, configStr, providerKey);
+        }
 
-        if (!providerName.empty() && providerName != "local") {
+        if (!providerKey.empty() && providerKey != "local") {
             provider = CreateCloudProvider(providerName);
             if (provider) {
                 std::string initPath = tokenPath;
                 std::string syncPath = cfg["sync_path"].str();
-                if (providerName == "folder" && !syncPath.empty()) {
+                if (providerKey == "folder" && !syncPath.empty()) {
                     initPath = syncPath;
                 }
 

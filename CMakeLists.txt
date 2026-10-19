@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# 源码统一按 UTF-8 解析：MSVC 默认用系统代码页（936）读中文注释会把字节
+# 误判成别的字符，极端情况下吞掉换行引发语法错误；显式指定后也顺带消除 C4819。
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # ── Read version from Version.props ─────────────────────────────────────
 file(READ "${CMAKE_SOURCE_DIR}/Version.props" VERSION_PROPS_CONTENT)
 string(REGEX MATCH "<ReleaseVersion>([^<]+)</ReleaseVersion>" _ "${VERSION_PROPS_CONTENT}")
@@ -96,6 +102,7 @@ set(PROVIDER_SOURCES
     src/providers/local_disk_provider.cpp
     src/providers/s3_provider.cpp
     src/providers/r2_provider.cpp
+    src/providers/webdav_provider.cpp
 )
 
 if(WIN32)
@@ -354,6 +361,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
         src/providers/local_disk_provider.cpp
         src/providers/s3_provider.cpp
         src/providers/r2_provider.cpp
+        src/providers/webdav_provider.cpp
     )
     target_include_directories(cloud_storage_staging_tests PRIVATE src/common src/providers src/testutil)
     if(WIN32)

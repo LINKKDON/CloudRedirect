@@ -6,6 +6,7 @@
 #include "onedrive_provider.h"
 #include "s3_provider.h"
 #include "r2_provider.h"
+#include "webdav_provider.h"
 #include "cloud_metadata_paths.h"
 #include "cloud_staging.h"
 #include "file_util.h"
@@ -3155,6 +3156,10 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
     if (lower == "s3") {
         return std::make_unique<S3Provider>();
     }
+    // WebDAV 用配置文件里的 URL + 账号密码直连，不涉及 OAuth 刷新回调。
+    if (lower == "webdav" || lower == "dav") {
+        return std::make_unique<WebDavProvider>();
+    }
     // Wire the auth-failure callback at construction so CloudProviderBase
     // doesn't reverse-depend on CloudStorage.
     auto wireAuthCallback = [](std::unique_ptr<CloudProviderBase> p)
@@ -3175,18 +3180,27 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
 std::string ResolveProviderTokenPath(const std::string& configDir,
                                      const std::string& configJson,
                                      const std::string& provider) {
+    // Provider 名按大小写不敏感处理：CLI/宿主可能传 "WebDAV"，
+    // 而配置文件里的 provider 与 token_paths 键统一写小写。
+    std::string p = provider;
+    for (auto& c : p) c = (char)tolower((unsigned char)c);
+
     if (!configJson.empty()) {
         Json::Value root = Json::Parse(configJson);
         if (root.type == Json::Type::Object) {
             // 1) Per-provider registry (survives provider switches).
-            if (root.has("token_paths") && root["token_paths"].type == Json::Type::Object &&
-                root["token_paths"].has(provider) &&
-                root["token_paths"][provider].type == Json::Type::String &&
-                !root["token_paths"][provider].str().empty()) {
-                return root["token_paths"][provider].str();
+            const Json::Value& paths = root["token_paths"];
+            if (root.has("token_paths") && paths.type == Json::Type::Object) {
+                for (const std::string& key : {provider, p}) {
+                    if (paths.has(key) && paths[key].type == Json::Type::String &&
+                        !paths[key].str().empty())
+                        return paths[key].str();
+                }
             }
             // 2) Active provider's token_path (legacy / single-provider path).
-            if (root.has("provider") && root["provider"].str() == provider &&
+            std::string active = root["provider"].str();
+            for (auto& c : active) c = (char)tolower((unsigned char)c);
+            if (root.has("provider") && active == p &&
                 root.has("token_path") && root["token_path"].type == Json::Type::String &&
                 !root["token_path"].str().empty()) {
                 return root["token_path"].str();
@@ -3197,11 +3211,13 @@ std::string ResolveProviderTokenPath(const std::string& configDir,
     // 3) Convention-based fallback. Must match the exact default filenames the
     //    UI writes so a first run works before Settings has persisted an
     //    explicit token_paths entry. Windows and Linux use different names.
-    if (provider == "r2")       return configDir + "r2_credentials.json";
-    if (provider == "s3")       return configDir + "s3_credentials.json";
+    if (p == "r2")       return configDir + "r2_credentials.json";
+    if (p == "s3")       return configDir + "s3_credentials.json";
+    if (p == "webdav" || p == "dav")
+        return configDir + "webdav_credentials.json";
 #ifdef _WIN32
-    if (provider == "gdrive")   return configDir + "google_tokens.json";
-    if (provider == "onedrive") return configDir + "onedrive_tokens.json";
+    if (p == "gdrive")   return configDir + "google_tokens.json";
+    if (p == "onedrive") return configDir + "onedrive_tokens.json";
 #endif
-    return configDir + "tokens_" + provider + ".json";
+    return configDir + "tokens_" + p + ".json";
 }

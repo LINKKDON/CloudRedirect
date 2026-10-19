@@ -42,8 +42,43 @@ CloudRedirect for Windows consists of a C++ DLL and a WPF companion app:
 - **Cloudflare R2**
 - **S3-Compatible** - AWS S3, MinIO, Backblaze B2, Wasabi, DigitalOcean Spaces, and any self-hosted S3 server.
 - **Local folder / mapped drive** - by request of literally one user.
+- **WebDAV** - 通用 WebDAV 服务端（Nextcloud/ownCloud、Alist/OpenList、坚果云、群晖、IIS、Apache mod_dav 等），支持 Basic/Digest/NTLM/Negotiate/Bearer/匿名与自签证书。
 
 With more to come over time. 
+
+### WebDAV
+
+通用 WebDAV 支持，不做特定服务端适配；认证覆盖 Basic、Digest、NTLM、Negotiate、Bearer、匿名，传输覆盖 HTTPS、自签证书、内网 HTTP、自定义端口与系统代理。
+
+本仓库只维护 Windows DLL，WebDAV 的配置入口由宿主（Fluent-Steam-Lua）的云存档页写入 `%APPDATA%\CloudRedirect\`：
+
+- `config.json`：`"provider": "webdav"`，`token_path` 指向凭据文件（留空时回退到 `webdav_credentials.json`）。
+- `webdav_credentials.json` 示例：
+
+```json
+{
+  "url": "https://dav.example.com/remote.php/dav/files/user/",
+  "username": "user",
+  "password": "app-password",
+  "auth": "basic",
+  "key_prefix": "",
+  "allow_insecure_http": false,
+  "allow_insecure_tls": false,
+  "timeout_sec": 0,
+  "extra_headers": []
+}
+```
+
+字段说明：
+
+- `url`：目标集合的完整地址（WebDAV 服务器或用户目录）；工具会自动在其下创建 `CloudRedirect` 目录，若 URL 已以 `/CloudRedirect` 结尾则直接使用。
+- `auth`：`basic`（默认，预发送）、`auto`（401 协商，自动选择 Digest/NTLM/Negotiate）、`digest`、`ntlm`、`negotiate`、`bearer`（配合 `bearer_token`）、`none`（匿名）。
+- `key_prefix`：base 下的可选子目录，含空格/中文会自动编码。
+- `allow_insecure_tls`：跳过证书校验（自签服务端）。URL 显式写成 `http://` 时即视为允许明文并记录警告；`allow_insecure_http` 仅为与其它 provider 的配置字段保持一致而保留。
+- `timeout_sec`：单请求超时秒数，0 表示传输层默认值（最大 300）。
+- `extra_headers`：附加请求头，例如 IIS 的 `Translate: f`。
+
+凭据文件可直接写明文 JSON，DLL 首次读取时会用 DPAPI 加密回写；修改配置后需重启 Steam。部分服务端（如 IIS）需要自行启用 WebDAV 发布并调整请求体大小限制。
 
 ## Usage (Windows)
 
