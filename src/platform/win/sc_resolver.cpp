@@ -815,14 +815,13 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
             LOG("[Resolver] PlaytimeWriter: not resolved");
     }
 
-    // Phase 12: PbMsgCtor — loads CProtoBufMsgBase vtable via RTTI, stores to [rcx],
-    // and has `mov [rcx+38h], r8d` (44 89 41 38) at +0x0A.
+    // Phase 12: PbMsgCtor — CProtoBufMsgBase 构造函数：把基类 vtable 存到 [rcx]。
+    // 旧版在 prologue 后直接把第三参数存到 +0x38；新版先 mov rdi,rcx，参数存储
+    // 下移到 +0x40。用「prologue + LEA 基类 vtable」两段式定位兼容两种布局。
     {
         uintptr_t baseMsgVtable = SigScanner::ResolveVtableByRtti(".?AVCProtoBufMsgBase@@");
         if (baseMsgVtable) {
-            // PbMsgCtor: sub rsp,30h then LEA rax, CProtoBufMsgBase_vt; mov [rcx], rax
-            // Unique anchor: 44 89 41 38 (mov [rcx+38h], r8d) at offset +0x0A
-            // Full prologue: 48 89 5C 24 08 57 48 83 EC 30 44 89 41 38
+            // 旧版：48 89 5C 24 08 57 48 83 EC 30 44 89 41 38
             static const uint8_t pat[] = {
                 0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
                 0x57,                           // push rdi
@@ -831,21 +830,39 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
             };
             static const char mask[] = "xxxxxxxxxxxxxx";
             uintptr_t hit = SigScanner::FindPattern(pat, mask, 14);
-            if (hit) {
-                // Verify it LEAs the CProtoBufMsgBase vtable within the next 10 bytes
-                uintptr_t leaTarget = SigScanner::FindFirstRipRelLeaTarget(hit + 14, 10);
-                if (leaTarget == baseMsgVtable) {
-                    r.pbMsgCtor = hit;
-                    LOG("[Resolver] PbMsgCtor @ %p (RVA 0x%llX) via signature + vtable verify",
-                        (void*)hit, (uint64_t)(hit - steamClientBase));
-                }
+            if (hit && SigScanner::FindFirstRipRelLeaTarget(hit + 14, 10) == baseMsgVtable)
+                r.pbMsgCtor = hit;
+
+            // 新版 prologue 扫描（229 处同前缀，靠 vtable LEA 唯一确认）
+            if (!r.pbMsgCtor) {
+                static const uint8_t ctorPrefix[] = {
+                    0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+                    0x57,                           // push rdi
+                    0x48, 0x83, 0xEC, 0x30,         // sub rsp, 30h
+                };
+                const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
+                size_t textSize = SigScanner::GetTextSize();
+                __try {
+                    for (size_t i = 0; i + sizeof(ctorPrefix) + 7 <= textSize; ++i) {
+                        if (text[i] != ctorPrefix[0]) continue;
+                        if (memcmp(text + i, ctorPrefix, sizeof(ctorPrefix)) != 0) continue;
+                        uintptr_t start = SigScanner::GetTextBase() + i;
+                        if (SigScanner::FindFirstRipRelLeaTarget(start + sizeof(ctorPrefix), 0x40) == baseMsgVtable) {
+                            r.pbMsgCtor = start;
+                            break;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
-            if (!r.pbMsgCtor)
+
+            if (r.pbMsgCtor)
+                LOG("[Resolver] PbMsgCtor @ %p (RVA 0x%llX) via prologue + vtable LEA",
+                    (void*)r.pbMsgCtor, (uint64_t)(r.pbMsgCtor - steamClientBase));
+            else
                 LOG("[Resolver] PbMsgCtor: not resolved");
 
-            // Phase 13: PbMsgCleanup — push rbx; sub rsp, 20h; lea rax, CProtoBufMsgBase_vt
-            // Pattern: 40 53 48 83 EC 20 48 8D 05 XX XX XX XX 48 8B D9
-            // where the LEA target == baseMsgVtable
+            // Phase 13: PbMsgCleanup — 旧版 prologue 40 53 48 83 EC 20；新版
+            // 48 89 5C 24 08 57 48 83 EC 20。两者都以 LEA 基类 vtable 校验。
             const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
             size_t textSize = SigScanner::GetTextSize();
             __try {
@@ -858,14 +875,27 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
                         uintptr_t target = instrAddr + 7 + disp;
                         if (target == baseMsgVtable) {
                             r.pbMsgCleanup = SigScanner::GetTextBase() + i;
-                            LOG("[Resolver] PbMsgCleanup @ %p (RVA 0x%llX) via prologue + vtable LEA",
-                                (void*)r.pbMsgCleanup, (uint64_t)(r.pbMsgCleanup - steamClientBase));
+                            break;
+                        }
+                    }
+                }
+                if (!r.pbMsgCleanup) {
+                    for (size_t i = 0; i + 16 <= textSize; ++i) {
+                        if (text[i] != 0x48 || text[i+1] != 0x89 || text[i+2] != 0x5C || text[i+3] != 0x24 ||
+                            text[i+4] != 0x08 || text[i+5] != 0x57 || text[i+6] != 0x48 || text[i+7] != 0x83 ||
+                            text[i+8] != 0xEC || text[i+9] != 0x20) continue;
+                        uintptr_t start = SigScanner::GetTextBase() + i;
+                        if (SigScanner::FindFirstRipRelLeaTarget(start + 10, 0x20) == baseMsgVtable) {
+                            r.pbMsgCleanup = start;
                             break;
                         }
                     }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
-            if (!r.pbMsgCleanup)
+            if (r.pbMsgCleanup)
+                LOG("[Resolver] PbMsgCleanup @ %p (RVA 0x%llX) via prologue + vtable LEA",
+                    (void*)r.pbMsgCleanup, (uint64_t)(r.pbMsgCleanup - steamClientBase));
+            else
                 LOG("[Resolver] PbMsgCleanup: not resolved");
         } else {
             LOG("[Resolver] PbMsgCtor/Cleanup: CProtoBufMsgBase RTTI not found");
@@ -888,8 +918,9 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         if (strAddr) {
             const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
             size_t textSize = SigScanner::GetTextSize();
-            // Check bytes: 48 83 79 30 00 = cmp qword ptr [rcx+30h], 0
-            static const uint8_t cmpPat[] = { 0x48, 0x83, 0x79, 0x30, 0x00 };
+            // Guard: cmp qword ptr [rcx+30h], 0（旧版）/ [rcx+38h], 0（1791+：body 下移）
+            static const uint8_t cmpPatOld[] = { 0x48, 0x83, 0x79, 0x30, 0x00 };
+            static const uint8_t cmpPatNew[] = { 0x48, 0x83, 0x79, 0x38, 0x00 };
 
             __try {
                 for (size_t i = 0; i + 7 <= textSize; ++i) {
@@ -906,11 +937,12 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
                             if (candidate < SigScanner::GetTextBase()) break;
                             if (!SigScanner::LooksLikeFunctionStart(candidate)) continue;
 
-                            // Verify: cmp [rcx+30h], 0 within first 13 bytes (prologue + guard)
+                            // Verify: cmp [rcx+30h/38h], 0 within first 13 bytes (prologue + guard)
                             const uint8_t* fn = reinterpret_cast<const uint8_t*>(candidate);
                             bool hasCmp = false;
                             for (int off = 0; off <= 8; off++) {
-                                if (memcmp(fn + off, cmpPat, 5) == 0) { hasCmp = true; break; }
+                                if (memcmp(fn + off, cmpPatOld, 5) == 0 ||
+                                    memcmp(fn + off, cmpPatNew, 5) == 0) { hasCmp = true; break; }
                             }
                             if (!hasCmp) break; // wrong function, try next xref
 

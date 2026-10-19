@@ -167,7 +167,8 @@ static constexpr uintptr_t SC_RVA_RESP_WRAPPER_VT    = 0x1334340;
 // off_1396E8248: pointer to "Software\\Valve\\Steam\\LastPlayedTimesSyncTime"
 static constexpr uintptr_t SC_RVA_REGKEY_SYNCTIME    = 0x16E8248;
 // CUser member offsets used by the writer path
-static constexpr uint32_t USER_OFF_REGISTRY          = 3272;   // CUser+0xCC8: registry obj (sync-time write)
+static constexpr uint32_t USER_OFF_REGISTRY          = 3272;   // CUser+0xCC8: registry obj (旧版 sync-time write)
+static constexpr uint32_t USER_OFF_REGISTRY_V2       = 3216;   // CUser+0xC90: 1791+ 布局（客户端 handler 实锤）
 // Inner CPlayer_GetLastPlayedTimes_Response message offsets
 static constexpr uint32_t RESP_OFF_GAMES_COUNT       = 24;     // repeated games: element count
 static constexpr uint32_t RESP_OFF_GAMES_ARRAY       = 32;     // repeated games: array base ptr
@@ -627,6 +628,161 @@ void SetNamespaceApps(const uint32_t* appIds, uint32_t count,
 
 static uintptr_t FindCurrentUser();
 
+// CEngine 内部偏移解析的诊断：失败时记录各阶段实际读数，便于定位失效偏移。
+// RequireAccountId 轮询会高频调用本路径，日志按进程限频避免刷屏。
+static std::atomic<int> g_findUserDiagFail{0};
+static std::atomic<bool> g_findUserDiagOk{false};
+static void LogFindUserDiag(const char* stage, uintptr_t engine, uint32_t handle,
+                            uintptr_t mapArray, int32_t count) {
+    if (g_findUserDiagFail.fetch_add(1, std::memory_order_relaxed) >= 3) return;
+    LOG("[UserScan] FindCurrentUser failed at %s: engine=%p handle=%u mapArray=%p count=%d",
+        stage, (void*)engine, handle, (void*)mapArray, count);
+}
+
+// ── 用户表探测 ─────────────────────────────────────────────────────────
+// 1791 上 handle 偏移(+0xC48)读 0 后，这里一次性只读扫描 engine 内存里的候选
+// {handle, pad, CUser*} 表，用运行时解析的 accountId 偏移逐项比对，验证
+// 「账号反查 user*」能否作为 handle 偏移失效时的替代定位路径。
+// VirtualQuery 先过滤可读性，解引用全部 SEH 保护，全程无写入。
+
+static uint32_t PeekResolvedAccountId(); // 定义在 g_steamId 声明之后
+
+static void ProbeReadMapSlot(uintptr_t base, uintptr_t* arr, int32_t* count) {
+    *arr = 0;
+    *count = 0;
+    __try {
+        *arr = *(uintptr_t*)base;
+        *count = *(int32_t*)(base + 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool ProbeReadUserEntry(uintptr_t entry, uint32_t* handle, uintptr_t* user, uint32_t* acct) {
+    *handle = 0;
+    *user = 0;
+    *acct = 0;
+    __try {
+        *handle = *(uint32_t*)entry;
+        *user = *(uintptr_t*)(entry + 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __try {
+        *acct = *(uint32_t*)(*user + USER_OFF_ACCOUNTID);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true;
+}
+
+static void ProbeUserMapForAccount(uintptr_t engine, uint32_t accountId, const char* reason) {
+    LOG("[UserProbe] (%s) engine=%p account=%u old off +0x%X:", reason, (void*)engine,
+        accountId, ENGINE_OFF_USER_MAP);
+
+    uintptr_t oldArr = 0;
+    int32_t oldCount = 0;
+    ProbeReadMapSlot(engine + ENGINE_OFF_USER_MAP, &oldArr, &oldCount);
+    LOG("[UserProbe] (%s) old slot: arr=%p count=%d", reason, (void*)oldArr, oldCount);
+
+    int candLogged = 0;
+    int matches = 0;
+    for (uintptr_t off = 0x200; off < 0x3000; off += 8) {
+        uintptr_t arr = 0;
+        int32_t count = 0;
+        ProbeReadMapSlot(engine + off, &arr, &count);
+        if (!arr || count <= 0 || count > 64) continue;
+
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery((LPCVOID)arr, &mbi, sizeof(mbi))) continue;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) continue;
+
+        for (int32_t i = 0; i < count; i++) {
+            uint32_t handle = 0;
+            uintptr_t user = 0;
+            uint32_t acct = 0;
+            if (!ProbeReadUserEntry(arr + (uintptr_t)i * 16, &handle, &user, &acct)) break;
+            if (i == 0 && candLogged < 8) {
+                ++candLogged;
+                LOG("[UserProbe] (%s) cand +0x%llX arr=%p count=%d entry0: handle=%u user=%p acct=%u%s",
+                    reason, (unsigned long long)off, (void*)arr, count, handle, (void*)user, acct,
+                    off == ENGINE_OFF_USER_MAP ? " (old offset)" : "");
+            }
+            if (acct == accountId && matches < 4) {
+                ++matches;
+                LOG("[UserProbe] (%s) MATCH +0x%llX entry[%d]: handle=%u user=%p acct=%u",
+                    reason, (unsigned long long)off, i, handle, (void*)user, acct);
+            }
+        }
+    }
+
+    if (matches)
+        LOG("[UserProbe] (%s) probe done: %d match(es)", reason, matches);
+    else
+        LOG("[UserProbe] (%s) no account-matching entry in engine+[0x200..0x3000]", reason);
+}
+
+// 失败阶段的一次性探测入口：账号就绪才跑，避免高频失败路径重复探测
+static void MaybeProbeUserMapAtFail(uintptr_t engine) {
+    uint32_t acct = PeekResolvedAccountId();
+    if (acct == 0) return;
+    static std::atomic<bool> done{false};
+    if (done.exchange(true, std::memory_order_relaxed)) return;
+    ProbeUserMapForAccount(engine, acct, "fail-stage");
+}
+
+// 按旧版表项布局（{uint32 handle, uint32 pad, CUser*}，count 在槽位 +16）
+// 在指定槽位里按 accountId 匹配用户，命中返回 CUser*。
+static uintptr_t MatchUserInMapSlot(uintptr_t slot, uint32_t accountId) {
+    uintptr_t arr = 0;
+    int32_t count = 0;
+    ProbeReadMapSlot(slot, &arr, &count);
+    if (!arr || count <= 0 || count > 64) return 0;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery((LPCVOID)arr, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+
+    for (int32_t i = 0; i < count; i++) {
+        uint32_t handle = 0;
+        uintptr_t user = 0;
+        uint32_t acct = 0;
+        if (!ProbeReadUserEntry(arr + (uintptr_t)i * 16, &handle, &user, &acct)) return 0;
+        if (acct == accountId) return user;
+    }
+    return 0;
+}
+
+// 新构建里 CEngine 布局变化会让 handle / 用户表偏移失效；账号已知时按 accountId
+// 反查用户表作为兜底。命中后缓存表偏移，后续调用直接复用，避免重复扫描。
+static std::atomic<uintptr_t> g_userMapOffFound{0};
+// 旧版 handle 路径成功过：只有这种情况下 CUser 的深层偏移才可信。
+static std::atomic<bool> g_legacyUserLayout{false};
+
+static uintptr_t FindUserByAccountId(uintptr_t engine, uint32_t accountId) {
+    uintptr_t off = g_userMapOffFound.load(std::memory_order_relaxed);
+    if (off) {
+        uintptr_t user = MatchUserInMapSlot(engine + off, accountId);
+        if (user) return user;
+        g_userMapOffFound.store(0, std::memory_order_relaxed); // 偏移失效则重新扫描
+    }
+    for (uintptr_t cand = 0x200; cand < 0x3000; cand += 8) {
+        uintptr_t user = MatchUserInMapSlot(engine + cand, accountId);
+        if (user) {
+            g_userMapOffFound.store(cand, std::memory_order_relaxed);
+            LOG("[UserScan] account map located at engine+0x%llX (account=%u)",
+                (unsigned long long)cand, accountId);
+            return user;
+        }
+    }
+    return 0;
+}
+
+// 判断指针是否落在 steamclient64.dll 映像内：布局变化后用它挡住野指针调用。
+static bool IsInSteamClientImage(uintptr_t p) {
+    if (!p || !g_steamClientBase) return false;
+    auto* base = (uint8_t*)g_steamClientBase;
+    auto* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    return p >= g_steamClientBase && p < g_steamClientBase + nt->OptionalHeader.SizeOfImage;
+}
+
 static uintptr_t FindCurrentUser() {
     if (!g_steamClientBase) {
         HMODULE hSC = GetModuleHandleA("steamclient64.dll");
@@ -635,40 +791,71 @@ static uintptr_t FindCurrentUser() {
     }
 
     uintptr_t engineGlobal = SC_RESOLVE(globalEngine);
-    if (!engineGlobal) return 0;
+    if (!engineGlobal) {
+        LogFindUserDiag("no-globalEngine", 0, 0, 0, 0);
+        return 0;
+    }
     uintptr_t* pEngineGlobal = (uintptr_t*)engineGlobal;
     uintptr_t engine = 0;
     __try { engine = *pEngineGlobal; } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
-    if (!engine) return 0;
+    if (!engine) {
+        LogFindUserDiag("null-engine", 0, 0, 0, 0);
+        return 0;
+    }
 
+    // 旧版布局：全局 handle + 用户表（handle -> CUser*）
+    const char* stage = "handle-zero";
     uint32_t globalHandle = 0;
+    uintptr_t mapArray = 0;
+    int32_t mapCount = 0;
     __try { globalHandle = *(uint32_t*)(engine + ENGINE_OFF_GLOBAL_HANDLE); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
-    if (globalHandle == 0) return 0;
+    __except(EXCEPTION_EXECUTE_HANDLER) { globalHandle = 0; }
 
-    uintptr_t userMapBase = engine + ENGINE_OFF_USER_MAP;
-    uintptr_t arrayPtr = 0;
-    int32_t count = 0;
-    __try {
-        arrayPtr = *(uintptr_t*)(userMapBase);
-        count = *(int32_t*)(userMapBase + 16);
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (globalHandle != 0) {
+        __try {
+            mapArray = *(uintptr_t*)(engine + ENGINE_OFF_USER_MAP);
+            mapCount = *(int32_t*)(engine + ENGINE_OFF_USER_MAP + 16);
+        } __except(EXCEPTION_EXECUTE_HANDLER) { mapArray = 0; mapCount = 0; }
 
-    if (!arrayPtr || count <= 0 || count > 64) return 0;
-
-    uintptr_t userPtr = 0;
-    __try {
-        for (int32_t i = 0; i < count; i++) {
-            uintptr_t entry = arrayPtr + (uintptr_t)i * 16;
-            uint32_t handle = *(uint32_t*)entry;
-            if (handle == globalHandle) {
-                userPtr = *(uintptr_t*)(entry + 8);
-                break;
+        if (mapArray && mapCount > 0 && mapCount <= 64) {
+            uintptr_t userPtr = 0;
+            __try {
+                for (int32_t i = 0; i < mapCount; i++) {
+                    uintptr_t entry = mapArray + (uintptr_t)i * 16;
+                    if (*(uint32_t*)entry == globalHandle) {
+                        userPtr = *(uintptr_t*)(entry + 8);
+                        break;
+                    }
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) { userPtr = 0; }
+            if (userPtr) {
+                g_legacyUserLayout.store(true, std::memory_order_relaxed);
+                if (!g_findUserDiagOk.exchange(true, std::memory_order_relaxed))
+                    LOG("[UserScan] FindCurrentUser OK: handle=%u mapCount=%d user=%p",
+                        globalHandle, mapCount, (void*)userPtr);
+                return userPtr;
             }
+            stage = "no-matching-entry";
+        } else {
+            stage = "map-invalid";
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
 
-    return userPtr;
+    // 新版布局：旧偏移失效时，按已解析账号在 engine 内存里反查用户表项。
+    uint32_t acct = PeekResolvedAccountId();
+    if (acct != 0) {
+        uintptr_t userPtr = FindUserByAccountId(engine, acct);
+        if (userPtr) {
+            if (!g_findUserDiagOk.exchange(true, std::memory_order_relaxed))
+                LOG("[UserScan] FindCurrentUser OK via account map: account=%u user=%p",
+                    acct, (void*)userPtr);
+            return userPtr;
+        }
+    }
+
+    LogFindUserDiag(stage, engine, globalHandle, mapArray, mapCount);
+    MaybeProbeUserMapAtFail(engine);
+    return 0;
 }
 
 // Scan for CUser accountId offset: find UserGameStats_%u string -> code xref ->
@@ -772,14 +959,67 @@ static uint32_t ScanUserAccountIdOffset() {
 }
 
 // Read account id from CUser when no RPC header is available yet. SEH-isolated.
+static std::atomic<int> g_acctReadDiagZero{0};
 static uint32_t ReadAccountIdFromUser() {
     uintptr_t user = FindCurrentUser();
     if (!user) return 0;
     uint32_t acct = 0;
     __try { acct = *(uint32_t*)(user + USER_OFF_ACCOUNTID); }
     __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (acct == 0 && g_acctReadDiagZero.fetch_add(1, std::memory_order_relaxed) < 3)
+        LOG("[UserScan] CUser accountId read zero at offset %u (user=%p)",
+            USER_OFF_ACCOUNTID, (void*)user);
     return acct;
 }
+
+// 后备账号解析：通过公开 SteamClient 接口（steamclient64!CreateInterface）读取当前登录账号。
+// 内部 CUser 偏移随 Steam 版本漂移，这里用不依赖私有布局的公开 ABI 兜底；
+// 只能在后台线程调用——从 Steam 主线程发起会阻塞必须响应本次 IPC 的服务端。
+// vtable 索引对照 Steamworks 公开头文件：Client[0]=CreateSteamPipe,[1]=BReleaseSteamPipe,
+// [2]=ConnectToGlobalUser,[4]=ReleaseUser,[5]=GetISteamUser；User[1]=BLoggedOn,[2]=GetSteamID。
+static uint32_t ReadAccountIdViaSteamClientIpc() {
+    HMODULE sc = GetModuleHandleA("steamclient64.dll");
+    if (!sc) return 0;
+    auto create = reinterpret_cast<void* (__cdecl*)(const char*, int*)>(
+        GetProcAddress(sc, "CreateInterface"));
+    if (!create) return 0;
+    __try {
+        // 主版本优先，缺失时回退旧版本（接口 vtable 布局跨版本一致）
+        void* client = create("SteamClient020", nullptr);
+        if (!client) client = create("SteamClient019", nullptr);
+        if (!client) return 0;
+        auto cv = *reinterpret_cast<void***>(client);
+        int pipe = reinterpret_cast<int (__fastcall*)(void*)>(cv[0])(client);
+        if (!pipe) return 0;
+        int user = reinterpret_cast<int (__fastcall*)(void*, int)>(cv[2])(client, pipe);
+        uint32_t accountId = 0;
+        if (user) {
+            auto getUser = reinterpret_cast<void* (__fastcall*)(void*, int, int, const char*)>(cv[5]);
+            void* iface = getUser(client, user, pipe, "SteamUser023");
+            if (!iface) iface = getUser(client, user, pipe, "SteamUser022");
+            if (iface) {
+                auto uv = *reinterpret_cast<void***>(iface);
+                bool loggedOn = reinterpret_cast<bool (__fastcall*)(void*)>(uv[1])(iface);
+                // GetSteamID 返回 8 字节 CSteamID：MSVC x64 通常经 RAX 直接返回，
+                // 个别编译形态走隐藏结果指针；两种形态都接受，且只认个人账号类型。
+                uint64_t sid = 0;
+                uint64_t returned = reinterpret_cast<uint64_t (__fastcall*)(void*, uint64_t*)>(uv[2])(iface, &sid);
+                if ((sid >> 32) != 0x01100001 && (returned >> 32) == 0x01100001)
+                    sid = returned;
+                if (loggedOn && (sid >> 32) == 0x01100001)
+                    accountId = static_cast<uint32_t>(sid);
+            }
+            reinterpret_cast<void (__fastcall*)(void*, int, int)>(cv[4])(client, pipe, user);
+        }
+        reinterpret_cast<bool (__fastcall*)(void*, int)>(cv[1])(client, pipe);
+        return accountId;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// 业务侧拿账号失败时置位，唤醒后备线程立即重试（平时后备线程按秒级周期轮询）。
+static std::atomic<bool> g_accountResolverKick{false};
 
 
 // cave replacement buffer globals (still needed for passthrough SteamTools hook)
@@ -790,6 +1030,11 @@ static std::atomic<uint64_t> g_steamId{0};
 static std::atomic<int32_t> g_sessionId{0};
 // True once g_steamId came from a real packet header (authoritative over CUser fallback).
 static std::atomic<bool> g_steamIdFromHeader{false};
+
+// FindCurrentUser 的探测需要在声明顺序之前取账号：只读已解析值，不走 CUser 回退，避免调用成环。
+static uint32_t PeekResolvedAccountId() {
+    return (uint32_t)(g_steamId.load(std::memory_order_relaxed) & 0xFFFFFFFF);
+}
 
 void SetAccountId(uint32_t accountId) {
     // SteamID: universe=1, type=1, instance=1
@@ -1516,7 +1761,7 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
         return;
     }
 
-    // Stack CProtoBufMsg: [0]=vtable, [1]=descriptor, [6]=inner body (from init).
+    // Stack CProtoBufMsg: [0]=vtable, [1]=descriptor, body 在 +0x38（1791+）或 +0x30（旧版）。
     uintptr_t wrapper[11] = {0};
     using MsgCtorFn = void(__fastcall*)(void* self, int a2, int a3);
     using MsgInitFn = void(__fastcall*)(void* self);
@@ -1545,7 +1790,9 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
         wrapper[1] = descAddr;
         msgInit(wrapper);
 
-        uintptr_t inner = wrapper[6]; // m_pProtoBufBody (the inner MessageLite)
+        // m_pProtoBufBody：1791 起在 +0x38（旧版 +0x30）。ctor 先清零，finalize 才写入。
+        uintptr_t inner = *(uintptr_t*)((uint8_t*)wrapper + 0x38);
+        if (!inner) inner = *(uintptr_t*)((uint8_t*)wrapper + 0x30);
         if (!inner) {
             LOG("[Stats] ApplyLastPlayedUpdate: inner body alloc failed");
             msgDtor(wrapper);
@@ -1567,14 +1814,24 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
             uint32_t syncTime = writer(pUser, games, count);
             // Persist LastPlayedTimesSyncTime (sub_1389DA1D0 tail).
             __try {
-                uintptr_t reg = pUser + USER_OFF_REGISTRY;
-                auto regWrite = (RegWriteFn)(*(uintptr_t*)(*(uintptr_t*)reg + 80));
-                uintptr_t keyPtr = SC_RESOLVE(regKeySyncTime);
-                if (keyPtr) {
-                    const char* key = *(const char**)keyPtr;
-                    regWrite((void*)reg, 3, key, syncTime);
+                bool legacy = g_legacyUserLayout.load(std::memory_order_relaxed);
+                // 旧版 registry 在 CUser+0xCC8，1791 起下移到 +0xC90（客户端 handler 实锤）。
+                uintptr_t reg = pUser + (legacy ? USER_OFF_REGISTRY : USER_OFF_REGISTRY_V2);
+                uintptr_t regVt = *(uintptr_t*)reg;
+                uintptr_t regWriteFn = regVt ? *(uintptr_t*)(regVt + 80) : 0;
+                // 深层偏移无法完全验证：vtable/函数指针必须在映像内，否则跳过。
+                // 跳过只影响同步时间落盘，下次启动会重新同步。
+                if (!IsInSteamClientImage(regVt) || !IsInSteamClientImage(regWriteFn)) {
+                    LOG("[Stats] ApplyLastPlayedUpdate: skip sync-time write (registry vtable invalid)");
                 } else {
-                    LOG("[Stats] RegKeySyncTime not resolved");
+                    auto regWrite = (RegWriteFn)regWriteFn;
+                    uintptr_t keyPtr = SC_RESOLVE(regKeySyncTime);
+                    if (keyPtr) {
+                        const char* key = *(const char**)keyPtr;
+                        regWrite((void*)reg, 3, key, syncTime);
+                    } else {
+                        LOG("[Stats] RegKeySyncTime not resolved");
+                    }
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER) {
                 LOG("[Stats] ApplyLastPlayedUpdate: sync-time write threw (non-fatal)");
@@ -1601,6 +1858,9 @@ uint32_t GetAccountId() {
         uint64_t expected = 0;
         if (g_steamId.compare_exchange_strong(expected, full))
             LOG("[NS] Account id %u read from CUser (no packet scraped yet)", acct);
+    } else {
+        // 所有来源都还没有账号：唤醒后备线程立即用公开 SteamClient IPC 重试
+        g_accountResolverKick.store(true, std::memory_order_relaxed);
     }
     return acct;
 }
@@ -3977,7 +4237,7 @@ static void TryAutoUpdateDll() {
 
     // Fetch releases from GitHub
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect-AutoUpdate/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
         LOG("[AutoUpdate] WinHttpOpen failed: %u", GetLastError());
@@ -4941,6 +5201,50 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
 
     SteamKvInjector::Init();
 
+    // 账号后备解析线程：网络包 / 宿主（CR_SetAccountId、HandleCloudRpc 传参）之外的第三来源。
+    // 用公开 SteamClient IPC 读取当前登录账号，覆盖"启动早期还没抓到包、还没登录、宿主没传账号"
+    // 导致云 RPC 只能安全 no-op 的窗口；内部 CUser 偏移失效时这也是唯一可用的兜底。
+    // 成功即停；期间按秒级轮询，业务侧取账号失败（g_accountResolverKick）时立即重试。
+    {
+        std::thread accountResolver([] {
+            // 给 Steam 引擎起步留出时间，避免开局过早查询失败
+            for (int i = 0; i < 2 && !g_shuttingDown.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            for (int attempt = 0; attempt < 300 && !g_shuttingDown.load(); ++attempt) {
+                if (GetAccountId() != 0) break; // 已被网络包 / 宿主写入
+                uint32_t accountId = ReadAccountIdViaSteamClientIpc();
+                if (accountId != 0) {
+                    // 二次确认：期间可能已被网络包或宿主写入（同一账号，但避免无谓覆盖）
+                    if (GetAccountId() == 0 && !g_shuttingDown.load()) {
+                        SetAccountId(accountId);
+                        HttpServer::SetAccountId(accountId);
+                        LOG("[NS] Account id %u resolved via SteamClient IPC", accountId);
+                        ScheduleStartupMetadataSync();
+                    }
+                    break;
+                }
+                // 1 秒周期内分片小睡，kick 到达时立即进入下一轮
+                for (int t = 0; t < 4 && !g_shuttingDown.load(); ++t) {
+                    if (g_accountResolverKick.exchange(false, std::memory_order_relaxed)) break;
+                    Sleep(250);
+                }
+            }
+            // 登录后做一次健康检查：让用户表解析路径尽早跑一遍并缓存新布局偏移，
+            // 解析失败时由 FindCurrentUser 内部的一次性探测输出诊断。
+            if (g_shuttingDown.load()) return;
+            uint32_t acct = PeekResolvedAccountId();
+            for (int t = 0; t < 10 && acct != 0 && !g_shuttingDown.load(); ++t)
+                Sleep(1000);
+            if (g_shuttingDown.load() || acct == 0) return;
+            FindCurrentUser();
+        });
+        std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
+        if (g_shuttingDown.load(std::memory_order_acquire))
+            accountResolver.detach();
+        else
+            g_bgThreads.push_back(std::move(accountResolver));
+    }
+
 
     if (g_syncLuas) {
         g_luaSyncThread = std::thread([] {
@@ -5834,7 +6138,7 @@ static bool AppSupportsAchievements(uint32_t appId) {
     swprintf_s(path, L"/api/appdetails?appids=%u&filters=categories", appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return true;  // fail-open
     WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);
@@ -5901,7 +6205,7 @@ static std::vector<uint64_t> FetchReviewOwnerIds(uint32_t appId) {
                L"&purchase_type=all&num_per_page=20", appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return ids;
     WinHttpSetTimeouts(hSession, 3000, 3000, 5000, 5000);
@@ -5970,7 +6274,7 @@ static bool HasPublicStats(uint32_t appId, uint64_t steamId) {
                (unsigned long long)steamId, appId);
 
     HINTERNET hSession = WinHttpOpen(L"CloudRedirect/2.2",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 2000, 2000, 3000, 3000);

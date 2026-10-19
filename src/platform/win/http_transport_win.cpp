@@ -22,8 +22,10 @@ public:
 
     bool Init() override {
         if (m_session) return true;
+        // AUTOMATIC_PROXY 读取系统（IE/WinINet 层）代理设置；DEFAULT_PROXY 只看
+        // netsh winhttp 级静态配置，用户开在系统层的代理对它不可见，会直连超时。
         m_session = WinHttpOpen(L"CloudRedirect/1.0",
-                                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!m_session) {
             LOG("%s WinHttpOpen failed: %u", m_logTag, GetLastError());
